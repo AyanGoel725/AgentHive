@@ -1,0 +1,40 @@
+"""
+Generate sample demo files for AgentHive testing.
+Run: python create_samples.py
+"""
+import os
+
+SAMPLES_DIR = os.path.join(os.path.dirname(__file__), "samples")
+os.makedirs(SAMPLES_DIR, exist_ok=True)
+
+# ── Sample CSV (Excel-like demo data) ────────────────────────────────
+
+csv_content = """Name,Department,Salary,Performance_Score,Years_Experience,City
+Alice Johnson,Engineering,95000,4.5,8,San Francisco
+Bob Smith,Marketing,72000,3.8,5,New York
+Carol Davis,Engineering,102000,4.7,10,Seattle
+David Wilson,Sales,68000,3.5,3,Chicago
+Emma Brown,Engineering,98000,4.2,7,San Francisco
+Frank Miller,Marketing,75000,4.0,6,New York
+Grace Lee,Data Science,110000,4.9,12,Seattle
+Henry Taylor,Sales,71000,3.6,4,Chicago
+Iris Chen,Data Science,105000,4.6,9,San Francisco
+Jack Anderson,Engineering,88000,3.9,5,Seattle
+Kate Martinez,Marketing,78000,4.1,7,New York
+Liam Thomas,Sales,65000,3.3,2,Chicago
+Mia Jackson,Data Science,112000,4.8,11,San Francisco
+Noah White,Engineering,93000,4.3,6,Seattle
+Olivia Harris,Marketing,70000,3.7,4,New York
+"""
+
+csv_path = os.path.join(SAMPLES_DIR, "employee_data.csv")
+with open(csv_path, "w") as f:
+    f.write(csv_content.strip())
+
+print(f"✅ Created: {csv_path}")
+
+# ── Sample text file (to test with — simulates a resume-like PDF) ──
+
+print(f"\n📄 Sample CSV created in: {SAMPLES_DIR}")
+print("📝 For PDF demo, use any PDF file you have.")
+print("\n🚀 Ready to run AgentHive!")
