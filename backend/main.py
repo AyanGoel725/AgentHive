@@ -1,37 +1,46 @@
 """
-AgentHive — FastAPI Application
-Multi-Agent Document Intelligence API
+AgentHive — FastAPI Application Entry Point
+Use Case 1: Document Intelligence (PDF/Excel -> Summary + Question Extraction)
 """
-
 from __future__ import annotations
 
+import asyncio
 import shutil
-import uuid
 from pathlib import Path
-from typing import Any
 
-import pandas as pd
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from core.config import UPLOAD_DIR, is_demo_mode
+from core.config import (
+    UPLOAD_DIR,
+    MAX_FILE_SIZE_MB,
+    ENABLE_MOCK_MODE,
+    validate_config,
+    is_demo_mode,
+)
 from core.schemas import (
-    DocumentMeta,
-    HealthResponse,
+    FullAnalysisResult,
+    ProcessingStatus,
     QueryRequest,
     QueryResponse,
     UploadResponse,
+    DocumentMetadata,
+    VoiceFormatRequest,
+    VoiceFormatResponse,
 )
-from agents.ingestion import ingest
-from agents.understanding import clean_text, chunk_text, build_vector_store
-from agents.orchestrator import route_query, AGENTS
+from core.utils import generate_doc_id
+from agents.orchestrator import orchestrator
+from agents.voice import format_for_speech
 
-# ── App ──────────────────────────────────────────────────────────────
+# ── App Setup ──────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="AgentHive API",
-    description="Multi-Agent Document Intelligence System",
-    version="1.0.0",
+    title="AgentHive - Document Intelligence",
+    description="Multi-agent system for PDF/Excel document analysis (Philips UC1)",
+    version="2.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
 )
 
 app.add_middleware(
@@ -42,146 +51,277 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── In-memory document store ─────────────────────────────────────────
+ALLOWED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".csv"}
+MAX_FILE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
-documents: dict[str, dict[str, Any]] = {}
-# Structure per doc_id:
-# {
-#     "meta": DocumentMeta,
-#     "text": str | None,
-#     "df": pd.DataFrame | None,
-#     "chunks": list[str],
-#     "vector_store": Any,
-#     "file_path": str,
-# }
+# In-memory status tracking for polling
+_processing_status: dict[str, dict] = {}
 
 
-# ── Endpoints ────────────────────────────────────────────────────────
+# ── Startup ────────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    warnings = validate_config()
+    for w in warnings:
+        print(f"[WARNING] CONFIG: {w}")
+    # NOTE: No emojis in print() — Windows CP1252 terminal cannot encode them
+    print(f"[INFO] AgentHive started | Mock Mode: {is_demo_mode()} | Upload Dir: {UPLOAD_DIR}")
 
 
-@app.get("/api/health", response_model=HealthResponse)
-async def health_check():
-    return HealthResponse(
-        status="ok",
-        demo_mode=is_demo_mode(),
-        agents=list(AGENTS.keys()),
-    )
+# ── Health ─────────────────────────────────────────────────────────────────────
 
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "healthy",
+        "mock_mode": is_demo_mode(),
+        "version": "2.0.0",
+        "agents": [
+            "IngestionAgent",
+            "DocumentClassifierAgent",
+            "SummarizationAgent",
+            "QuestionExtractorAgent",
+            "ExtractionAgent",
+            "UnderstandingAgent",
+            "OrchestratorAgent",
+        ],
+    }
+
+
+# ── Upload + Analyze ───────────────────────────────────────────────────────────
 
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload_document(file: UploadFile = File(...)):
-    """Upload a PDF, Excel, or CSV file for processing."""
-    ext = Path(file.filename or "unknown").suffix.lower()
-    if ext not in (".pdf", ".xlsx", ".xls", ".csv"):
-        raise HTTPException(400, f"Unsupported file type: {ext}. Use PDF, XLSX, XLS, or CSV.")
+    """
+    Upload a PDF or Excel file. Triggers the full analysis pipeline.
+    Returns immediately with pending status — poll /status for completion.
+    """
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
+        )
 
-    # Save file to disk
-    doc_id = uuid.uuid4().hex[:12]
-    save_path = UPLOAD_DIR / f"{doc_id}_{file.filename}"
-    with open(save_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Max size: {MAX_FILE_SIZE_MB}MB",
+        )
 
-    # Ingest
-    try:
-        content, meta = ingest(save_path)
-        meta.id = doc_id
-    except Exception as e:
-        save_path.unlink(missing_ok=True)
-        raise HTTPException(500, f"Ingestion failed: {e}")
+    doc_id = generate_doc_id()
+    save_path = UPLOAD_DIR / f"{doc_id}{suffix}"
+    save_path.write_bytes(file_bytes)
 
-    # Process based on file type
-    doc_record: dict[str, Any] = {
-        "meta": meta,
-        "text": None,
-        "df": None,
-        "chunks": [],
-        "vector_store": None,
-        "file_path": str(save_path),
+    _processing_status[doc_id] = {
+        "status": ProcessingStatus.PENDING,
+        "message": "Queued for processing",
     }
 
-    if meta.file_type == "pdf":
-        raw_text: str = content  # type: ignore
-        cleaned = clean_text(raw_text)
-        chunks = chunk_text(cleaned)
+    file_size = len(file_bytes)
+    immediate_metadata = DocumentMetadata(
+        doc_id=doc_id,
+        filename=file.filename or f"document{suffix}",
+        file_type="pdf" if suffix == ".pdf" else ("csv" if suffix == ".csv" else "excel"),
+        file_size_bytes=file_size,
+    )
+
+    async def status_callback(status: ProcessingStatus, message: str):
+        _processing_status[doc_id] = {"status": status, "message": message}
+
+    async def run_pipeline():
         try:
-            store = build_vector_store(chunks)
-        except Exception:
-            store = {"type": "demo", "chunks": chunks}
+            await orchestrator.analyze_document(
+                file_path=save_path,
+                doc_id=doc_id,
+                status_callback=status_callback,
+            )
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            with open("error_log.txt", "a") as f:
+                f.write(f"Error {doc_id}: {str(e)}\n{tb}\n")
+            _processing_status[doc_id] = {
+                "status": ProcessingStatus.ERROR,
+                "message": str(e),
+            }
+            print(f"[ERROR] Pipeline error for {doc_id}: {e}")
 
-        doc_record["text"] = cleaned
-        doc_record["chunks"] = chunks
-        doc_record["vector_store"] = store
-
-    elif meta.file_type == "excel":
-        df: pd.DataFrame = content  # type: ignore
-        doc_record["df"] = df
-        # Also create a text representation for summarization/extraction
-        text_repr = df.to_string()[:10000]
-        doc_record["text"] = text_repr
-
-    documents[doc_id] = doc_record
+    asyncio.create_task(run_pipeline())
 
     return UploadResponse(
-        success=True,
-        document=meta,
-        message=f"Successfully processed {meta.filename}",
+        doc_id=doc_id,
+        metadata=immediate_metadata,
+        status=ProcessingStatus.PENDING,
+        message="Document uploaded. Processing started in background.",
     )
 
+
+# ── Get Analysis Result ────────────────────────────────────────────────────────
+
+@app.get("/api/documents/{doc_id}/analysis", response_model=FullAnalysisResult)
+async def get_analysis(doc_id: str):
+    """Retrieve the full analysis result for a document."""
+    result = orchestrator.get_result(doc_id)
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document '{doc_id}' not found or still processing."
+        )
+    return result
+
+
+# ── Processing Status ──────────────────────────────────────────────────────────
+
+@app.get("/api/documents/{doc_id}/status")
+async def get_status(doc_id: str):
+    """Poll the processing status of a document."""
+    status = _processing_status.get(doc_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return status
+
+
+# ── Query / Q&A ───────────────────────────────────────────────────────────────
 
 @app.post("/api/query", response_model=QueryResponse)
-async def query_document(req: QueryRequest):
-    """Send a natural language query to be processed by the appropriate agent."""
-    if not req.document_id:
-        # Use the most recently uploaded document
-        if not documents:
-            raise HTTPException(400, "No documents uploaded yet. Please upload a file first.")
-        req.document_id = list(documents.keys())[-1]
-
-    doc = documents.get(req.document_id)
-    if not doc:
-        raise HTTPException(404, f"Document {req.document_id} not found.")
-
-    response = route_query(
-        query=req.query,
-        text=doc["text"],
-        df=doc["df"],
-        vector_store=doc["vector_store"],
-        file_type=doc["meta"].file_type,
-        is_voice=req.voice,
-    )
+async def query_document(request: QueryRequest):
+    """Ask a follow-up question about an analyzed document."""
+    result = orchestrator.get_result(request.doc_id)
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found. Upload a document first."
+        )
+    response = await orchestrator.query_document(request.doc_id, request.query)
     return response
 
 
-@app.post("/api/voice/query", response_model=QueryResponse)
-async def voice_query(req: QueryRequest):
-    """Voice-optimized query endpoint. Same as /api/query but marks voice=True."""
-    req.voice = True
-    return await query_document(req)
+# ── Voice ──────────────────────────────────────────────────────────────────────
+
+@app.post("/api/voice/format", response_model=VoiceFormatResponse)
+async def voice_format(request: VoiceFormatRequest):
+    """Format text for optimal text-to-speech readback."""
+    speech_text = format_for_speech(request.text)
+    return VoiceFormatResponse(speech_text=speech_text)
 
 
-@app.get("/api/documents")
+# ── List Documents ─────────────────────────────────────────────────────────────
+
+@app.get("/api/documents", response_model=list[DocumentMetadata])
 async def list_documents():
-    """List all uploaded documents."""
-    return {
-        "documents": [doc["meta"].model_dump() for doc in documents.values()]
-    }
+    """List all uploaded and analyzed documents."""
+    return orchestrator.list_documents()
 
+
+# ── Delete Document ────────────────────────────────────────────────────────────
 
 @app.delete("/api/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    """Delete an uploaded document."""
-    doc = documents.pop(doc_id, None)
-    if not doc:
-        raise HTTPException(404, f"Document {doc_id} not found.")
+    """Remove a document and all its analysis data."""
+    deleted = orchestrator.delete_document(doc_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Document not found.")
 
-    # Clean up file
-    file_path = Path(doc["file_path"])
-    file_path.unlink(missing_ok=True)
+    for ext in ALLOWED_EXTENSIONS:
+        path = UPLOAD_DIR / f"{doc_id}{ext}"
+        path.unlink(missing_ok=True)
 
-    return {"success": True, "message": f"Document {doc_id} deleted."}
+    _processing_status.pop(doc_id, None)
+    return {"message": f"Document '{doc_id}' deleted successfully."}
 
 
-# ── Run ──────────────────────────────────────────────────────────────
+# ── Export ─────────────────────────────────────────────────────────────────────
+
+@app.get("/api/documents/{doc_id}/export/json")
+async def export_json(doc_id: str):
+    """Export full analysis as JSON."""
+    result = orchestrator.get_result(doc_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return JSONResponse(content=result.model_dump(mode="json"))
+
+
+@app.get("/api/documents/{doc_id}/export/markdown")
+async def export_markdown(doc_id: str):
+    """Export analysis as a formatted Markdown report."""
+    result = orchestrator.get_result(doc_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    md = _build_markdown_report(result)
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        content=md,
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="{doc_id}_report.md"'
+        },
+    )
+
+
+def _build_markdown_report(result: FullAnalysisResult) -> str:
+    """Build a Markdown report from analysis results."""
+    lines = [
+        "# Document Analysis Report",
+        "",
+        f"**File**: {result.metadata.filename}  ",
+        f"**Type**: {result.classification.document_type.value}  ",
+        f"**Analyzed**: {result.metadata.upload_timestamp.strftime('%Y-%m-%d %H:%M UTC')}  ",
+        f"**Processing Time**: {result.processing_time_seconds}s  ",
+        "",
+        "---",
+        "",
+        "## Executive Summary",
+        "",
+        result.summary.executive_summary,
+        "",
+        "---",
+        "",
+        "## Detailed Summary",
+        "",
+        result.summary.detailed_summary,
+        "",
+        "---",
+        "",
+        "## Key Points",
+        "",
+    ]
+
+    for kp in result.summary.key_points:
+        icon = "[HIGH]" if kp.importance == "high" else "[MED]" if kp.importance == "medium" else "[LOW]"
+        lines.append(f"- {icon} {kp.point}")
+
+    lines += ["", "---", "", "## Topics", ""]
+    lines.append(", ".join(f"`{t}`" for t in result.summary.topics))
+
+    if result.questions:
+        lines += [
+            "", "---", "",
+            f"## Extracted Questions ({result.questions.total_questions})",
+            ""
+        ]
+        current_section = None
+        for q in result.questions.questions:
+            if q.section != current_section:
+                current_section = q.section
+                if current_section:
+                    lines += ["", f"### {current_section}", ""]
+            if q.category.value == "section_header":
+                lines.append(f"#### {q.text}")
+            else:
+                num = f"{q.number} " if q.number else ""
+                req = " *(required)*" if q.is_required else ""
+                lines.append(f"- **{num}{q.text}**{req}")
+                for opt in q.options:
+                    lines.append(f"  - {opt}")
+
+    return "\n".join(lines)
+
+
+# ── Run ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn

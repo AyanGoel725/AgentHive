@@ -1,15 +1,14 @@
 import React, { useCallback, useRef, useState } from 'react';
 import { uploadDocument } from '../api/client';
-import type { DocumentMeta } from '../types';
+import type { DocumentMetadata } from '../types';
 
 interface FileUploadProps {
-  onUpload: (doc: DocumentMeta) => void;
+  onUpload: (doc: DocumentMetadata) => void;
 }
 
 export default function FileUpload({ onUpload }: FileUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [progress, setProgress] = useState(0);
   const [error, setError] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -22,34 +21,22 @@ export default function FileUpload({ onUpload }: FileUploadProps) {
       return;
     }
 
+    if (file.size > 50 * 1024 * 1024) {
+       setError('File is too large. Maximum size is 50MB.');
+       return;
+    }
+
     setError('');
     setUploading(true);
-    setProgress(20);
 
     try {
-      // Simulate progress stages
-      const progressTimer = setInterval(() => {
-        setProgress(prev => Math.min(prev + 15, 85));
-      }, 300);
-
       const result = await uploadDocument(file);
-      clearInterval(progressTimer);
-      setProgress(100);
-
-      if (result.success) {
-        onUpload(result.document);
-        setTimeout(() => {
-          setUploading(false);
-          setProgress(0);
-        }, 600);
-      } else {
-        throw new Error(result.message || 'Upload failed');
-      }
+      onUpload(result.metadata);
+      setUploading(false);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Upload failed';
       setError(message);
       setUploading(false);
-      setProgress(0);
     }
   }, [onUpload]);
 
@@ -79,7 +66,7 @@ export default function FileUpload({ onUpload }: FileUploadProps) {
 
   return (
     <div className="sidebar__section">
-      <div className="sidebar__title">Upload Document</div>
+      <div className="sidebar__label" style={{ padding: 0, marginBottom: 8 }}>Upload Document</div>
       <div
         id="upload-zone"
         className={`upload-zone ${isDragging ? 'upload-zone--active' : ''}`}
@@ -90,37 +77,19 @@ export default function FileUpload({ onUpload }: FileUploadProps) {
       >
         <div className="upload-zone__icon">{uploading ? '⏳' : '📄'}</div>
         <div className="upload-zone__text">
-          {uploading ? 'Processing document...' : 'Drop files here or click to browse'}
+          {uploading ? 'Uploading...' : 'Drop files here or click to browse'}
         </div>
-        <div className="upload-zone__hint">PDF, XLSX, XLS, CSV</div>
+        <div className="upload-zone__hint">PDF, XLSX, XLS, CSV (Max 50MB)</div>
         <input
           ref={inputRef}
           type="file"
           accept=".pdf,.xlsx,.xls,.csv"
           onChange={handleInputChange}
         />
-
-        {uploading && (
-          <div className="upload-progress">
-            <div className="upload-progress__bar">
-              <div
-                className="upload-progress__fill"
-                style={{ width: `${progress}%` }}
-              />
-            </div>
-          </div>
-        )}
       </div>
 
       {error && (
-        <div style={{
-          marginTop: 8,
-          fontSize: 12,
-          color: 'var(--accent-rose)',
-          padding: '8px 12px',
-          borderRadius: 'var(--radius-sm)',
-          background: 'rgba(251,113,133,0.08)',
-        }}>
+        <div className="upload-error">
           {error}
         </div>
       )}

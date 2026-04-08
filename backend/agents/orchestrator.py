@@ -1,214 +1,220 @@
 """
-AgentHive — 🎯 Orchestrator Agent
-The brain of the system: classifies user intent and routes queries to the correct agent.
+🎯 Orchestrator Agent
+──────────────────────
+The central brain of the system for Use Case 1.
+Coordinates the full pipeline with PARALLEL execution where possible:
+  1. Ingest (sequential — needs file)
+  2. Classify + Build Vector Index (PARALLEL — both need raw text only)
+  3. Summarize + Extract Questions + Extract Data (PARALLEL — need raw text + classification)
+  4. Return complete result
+
+Also handles follow-up queries by routing to the understanding agent.
 """
-
 from __future__ import annotations
-from core.config import GOOGLE_API_KEY, MODEL_NAME, is_demo_mode
-from core.schemas import AgentInfo, QueryResponse
-from agents import voice as voice_agent
-import pandas as pd
+
+import asyncio
+from pathlib import Path
+from typing import Optional
+
+from core.schemas import (
+    FullAnalysisResult,
+    ProcessingStatus,
+    QueryResponse,
+    DocumentMetadata,
+)
+from core.utils import Timer
+
+from agents.ingestion import ingestion_agent, IngestionResult
+from agents.document_classifier import classifier_agent
+from agents.summarization import summarization_agent
+from agents.question_extractor import question_extractor_agent
+from agents.understanding import understanding_agent
+from agents.extraction import extract_structured
 
 
-# ── Agent registry ───────────────────────────────────────────────────
-
-AGENTS = {
-    "summarization": AgentInfo(
-        name="Summarization Agent",
-        icon="✍️",
-        description="Generates concise document summaries",
-    ),
-    "extraction": AgentInfo(
-        name="Extraction Agent",
-        icon="🧾",
-        description="Extracts structured data as JSON",
-    ),
-    "excel_insight": AgentInfo(
-        name="Excel Insight Agent",
-        icon="📊",
-        description="Analyzes datasets for trends and insights",
-    ),
-    "search": AgentInfo(
-        name="Understanding Agent",
-        icon="🧠",
-        description="Performs semantic search across documents",
-    ),
-}
-
-
-# ── Intent keywords ──────────────────────────────────────────────────
-
-INTENT_MAP = {
-    "summarization": [
-        "summarize", "summary", "overview", "brief", "recap",
-        "key points", "main ideas", "tldr", "tl;dr", "outline",
-    ],
-    "extraction": [
-        "extract", "json", "structured", "fields", "parse",
-        "entities", "data extraction", "convert to json",
-        "key-value", "pull out", "get fields",
-    ],
-    "excel_insight": [
-        "analyze", "analysis", "trend", "insight", "pattern",
-        "top values", "statistics", "correlat", "excel",
-        "data analysis", "chart", "distribution", "compare",
-    ],
-    "search": [
-        "search", "find", "where", "look for", "locate",
-        "what does it say about", "mention", "reference",
-    ],
-}
-
-
-def classify_intent(query: str, file_type: str | None = None) -> str:
+class OrchestratorAgent:
     """
-    Classify the user's intent to determine which agent to call.
-    Uses keyword matching first, then LLM fallback for ambiguous queries.
+    Manages the full document analysis pipeline and query routing.
+    Stores results in memory keyed by doc_id.
+    Uses parallel execution for speed.
     """
-    q = query.lower().strip()
 
-    # Score each intent
-    scores: dict[str, int] = {}
-    for intent, keywords in INTENT_MAP.items():
-        score = sum(1 for kw in keywords if kw in q)
-        scores[intent] = score
+    def __init__(self):
+        # In-memory store: doc_id → FullAnalysisResult
+        self._results: dict[str, FullAnalysisResult] = {}
+        # Store ingestion results for raw data access
+        self._ingestions: dict[str, IngestionResult] = {}
 
-    best = max(scores, key=scores.get)  # type: ignore
-    if scores[best] > 0:
-        return best
+    async def analyze_document(
+        self,
+        file_path: Path,
+        doc_id: str,
+        status_callback=None,
+    ) -> FullAnalysisResult:
+        """
+        Run the complete document analysis pipeline with parallel stages.
 
-    # If file is Excel and no clear intent, default to excel_insight
-    if file_type == "excel":
-        return "excel_insight"
+        Pipeline stages:
+          INGESTING → [CLASSIFYING + INDEXING] (parallel) →
+          [SUMMARIZING + EXTRACTING] (parallel) → COMPLETE
+        """
+        pipeline: list[str] = []
 
-    # If no clear intent, try LLM classification (or default in demo mode)
-    if not is_demo_mode():
-        return _llm_classify(query)
+        async def update_status(status: ProcessingStatus, message: str):
+            if status_callback:
+                await status_callback(status, message)
 
-    # Demo fallback: default to summarization
-    return "summarization"
+        with Timer() as total_timer:
+            # ── Stage 1: Ingestion (sequential) ──────────────────────────────
+            await update_status(ProcessingStatus.INGESTING, "Reading document...")
+            pipeline.append("IngestionAgent")
 
+            ingestion = await asyncio.to_thread(
+                ingestion_agent.ingest, file_path, doc_id
+            )
+            self._ingestions[doc_id] = ingestion
 
-def _llm_classify(query: str) -> str:
-    """Use LLM to classify ambiguous queries."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    from langchain.schema import HumanMessage
+            # ── Stage 2: Classification + Vector Index (PARALLEL) ────────────
+            await update_status(ProcessingStatus.CLASSIFYING, "Classifying & indexing document...")
+            pipeline.append("DocumentClassifierAgent")
+            pipeline.append("UnderstandingAgent")
 
-    llm = ChatGoogleGenerativeAI(
-        model=MODEL_NAME,
-        google_api_key=GOOGLE_API_KEY,
-        temperature=0.0,
-    )
+            # Prepare the index ready event BEFORE starting the task
+            understanding_agent.get_ready_event(doc_id)
 
-    prompt = f"""Classify this user query into one of these categories:
-- "summarization" (user wants a summary or overview)
-- "extraction" (user wants structured data / JSON output)
-- "excel_insight" (user wants data analysis, trends, statistics)
-- "search" (user wants to find specific information)
-
-Query: "{query}"
-
-Respond with ONLY the category name, nothing else:"""
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    result = response.content.strip().lower().strip('"')
-
-    if result in INTENT_MAP:
-        return result
-    return "summarization"
-
-
-def route_query(
-    query: str,
-    text: str | None = None,
-    df: pd.DataFrame | None = None,
-    vector_store=None,
-    file_type: str | None = None,
-    is_voice: bool = False,
-) -> QueryResponse:
-    """
-    Main entry point: classify intent, invoke the appropriate agent,
-    and return a unified response.
-    """
-    intent = classify_intent(query, file_type)
-    agent_info = AGENTS[intent]
-
-    try:
-        if intent == "summarization":
-            from agents.summarization import summarize
-            content = text or "No document text available."
-            answer = summarize(content, query)
-            return QueryResponse(
-                success=True,
-                agent=agent_info,
-                answer=answer,
-                audio_text=voice_agent.format_for_speech(answer) if is_voice else "",
+            classify_task = asyncio.to_thread(
+                classifier_agent.classify,
+                ingestion.raw_text,
+                ingestion.metadata.file_type,
+            )
+            index_task = asyncio.to_thread(
+                understanding_agent.build_index,
+                ingestion.raw_text,
+                doc_id,
             )
 
-        elif intent == "extraction":
-            from agents.extraction import extract_structured
-            content = text or "No document text available."
-            structured = extract_structured(content)
-            answer = "✅ Structured data extracted successfully. See the JSON output panel."
-            return QueryResponse(
-                success=True,
-                agent=agent_info,
-                answer=answer,
-                structured_data=structured,
-                audio_text=voice_agent.format_for_speech(
-                    f"I've extracted structured data from the document. Found {len(structured)} fields."
-                ) if is_voice else "",
+            # Run classification and indexing in parallel
+            classification, _num_chunks = await asyncio.gather(
+                classify_task, index_task
             )
 
-        elif intent == "excel_insight":
-            if df is None:
-                return QueryResponse(
-                    success=False,
-                    agent=agent_info,
-                    error="No Excel/CSV file uploaded. Please upload a dataset first.",
+            # ── Stage 3: Summarization + Extraction (PARALLEL) ───────────────
+            await update_status(ProcessingStatus.SUMMARIZING, "Generating summary & extracting data...")
+            pipeline.append("SummarizationAgent")
+
+            # Always run summarization
+            summarize_task = asyncio.to_thread(
+                summarization_agent.summarize,
+                ingestion.raw_text,
+                doc_id,
+                classification.document_type.value,
+            )
+
+            # Always run structured data extraction
+            pipeline.append("ExtractionAgent")
+            extraction_task = asyncio.to_thread(
+                extract_structured,
+                ingestion.raw_text,
+            )
+
+            # Conditionally run question extraction
+            questions_task = None
+            if classification.is_form_or_questionnaire:
+                await update_status(
+                    ProcessingStatus.EXTRACTING,
+                    "Detected questionnaire/form — extracting questions..."
                 )
-            from agents.excel_insight import analyze_dataframe
-            insights = analyze_dataframe(df, query)
-            return QueryResponse(
-                success=True,
-                agent=agent_info,
-                answer=insights["narrative"],
-                insights=insights["stats"],
-                audio_text=voice_agent.format_for_speech(insights["narrative"]) if is_voice else "",
-            )
-
-        elif intent == "search":
-            if vector_store is None:
-                return QueryResponse(
-                    success=False,
-                    agent=agent_info,
-                    error="No document indexed. Please upload a document first.",
+                pipeline.append("QuestionExtractorAgent")
+                questions_task = asyncio.to_thread(
+                    question_extractor_agent.extract_questions,
+                    ingestion.raw_text,
+                    doc_id,
                 )
-            from agents.understanding import semantic_search
-            results = semantic_search(query, vector_store, k=5)
-            answer = "🔍 **Search Results:**\n\n"
-            for i, chunk in enumerate(results, 1):
-                answer += f"**Result {i}:**\n{chunk}\n\n---\n\n"
-            return QueryResponse(
-                success=True,
-                agent=agent_info,
-                answer=answer,
-                audio_text=voice_agent.format_for_speech(
-                    f"I found {len(results)} relevant sections. " +
-                    (results[0][:200] if results else "No results found.")
-                ) if is_voice else "",
-            )
 
-        else:
-            return QueryResponse(
-                success=False,
-                agent=agent_info,
-                error=f"Unknown intent: {intent}",
-            )
+            # Gather all parallel tasks
+            if questions_task:
+                summary, extracted_data, questions = await asyncio.gather(
+                    summarize_task, extraction_task, questions_task
+                )
+            else:
+                summary, extracted_data = await asyncio.gather(
+                    summarize_task, extraction_task
+                )
+                questions = None
 
-    except Exception as e:
-        return QueryResponse(
-            success=False,
-            agent=agent_info,
-            error=str(e),
+            await update_status(ProcessingStatus.COMPLETE, "Analysis complete!")
+
+        result = FullAnalysisResult(
+            doc_id=doc_id,
+            metadata=ingestion.metadata,
+            classification=classification,
+            summary=summary,
+            questions=questions,
+            extracted_data=extracted_data,
+            processing_time_seconds=total_timer.elapsed,
+            agent_pipeline=pipeline,
         )
+
+        self._results[doc_id] = result
+        return result
+
+    async def query_document(
+        self, doc_id: str, query: str
+    ) -> QueryResponse:
+        """
+        Answer a follow-up question about an already-analyzed document.
+        Waits for the vector index to be ready before querying.
+        """
+        if doc_id not in self._results:
+            return QueryResponse(
+                doc_id=doc_id,
+                query=query,
+                answer="Document not found. Please upload and analyze the document first.",
+                relevant_sections=[],
+                confidence=0.0,
+            )
+
+        # Wait for index to be ready (with timeout)
+        index_ready = await understanding_agent.wait_for_index(doc_id, timeout=30.0)
+        if not index_ready:
+            return QueryResponse(
+                doc_id=doc_id,
+                query=query,
+                answer="The document index is still being built. Please try again in a few seconds.",
+                relevant_sections=[],
+                confidence=0.0,
+            )
+
+        # Run the Q&A in a thread to avoid blocking
+        answer, chunks, confidence = await asyncio.to_thread(
+            understanding_agent.answer_query, query, doc_id
+        )
+
+        return QueryResponse(
+            doc_id=doc_id,
+            query=query,
+            answer=answer,
+            relevant_sections=chunks[:3],
+            confidence=confidence,
+        )
+
+    def get_result(self, doc_id: str) -> Optional[FullAnalysisResult]:
+        """Retrieve cached analysis result."""
+        return self._results.get(doc_id)
+
+    def list_documents(self) -> list[DocumentMetadata]:
+        """List all analyzed documents."""
+        return [r.metadata for r in self._results.values()]
+
+    def delete_document(self, doc_id: str) -> bool:
+        """Remove a document and its associated data."""
+        if doc_id not in self._results:
+            return False
+        del self._results[doc_id]
+        self._ingestions.pop(doc_id, None)
+        understanding_agent.remove_index(doc_id)
+        return True
+
+
+# Singleton
+orchestrator = OrchestratorAgent()
