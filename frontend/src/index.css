@@ -545,6 +545,31 @@ body {
   color: #fff;
 }
 
+.message__bubble--md {
+  white-space: normal;
+}
+
+.message__bubble--md strong {
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.message__bubble--md em {
+  font-style: italic;
+  color: var(--text-2);
+}
+
+.message__bubble--md ul {
+  margin: 8px 0;
+  padding-left: 18px;
+  list-style: disc;
+}
+
+.message__bubble--md ul li {
+  margin-bottom: 4px;
+  line-height: 1.5;
+}
+
 .message__meta {
   display: flex;
   align-items: center;

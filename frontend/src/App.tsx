@@ -55,7 +55,6 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
-  const [ttsEnabled, setTtsEnabled] = useState(true);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -172,7 +171,7 @@ export default function App() {
   };
 
   const speakText = async (text: string) => {
-    if (!hasSpeechSynthesis || !ttsEnabled) return;
+    if (!hasSpeechSynthesis) return;
     window.speechSynthesis.cancel();
     try {
       const { speech_text } = await formatForSpeech(text);
@@ -210,7 +209,6 @@ export default function App() {
         ...prev,
         { id: Date.now() + 'a', role: 'agent', content: res.answer, response: res },
       ]);
-      if (ttsEnabled) speakText(res.answer);
     } catch (err) {
       setMessages(prev => [
         ...prev,
@@ -242,6 +240,31 @@ export default function App() {
   };
 
   const stopRecording = () => { recognitionRef.current?.stop(); setIsRecording(false); };
+
+  /** Lightweight markdown → HTML for agent responses */
+  const renderMarkdown = (text: string): string => {
+    let html = text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    // Bold: **text**
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // Italic: *text*
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    // Bullet lists
+    html = html.replace(/^[-•] (.+)$/gm, '<li>$1</li>');
+    // Numbered lists
+    html = html.replace(/^\d+\.\s(.+)$/gm, '<li>$1</li>');
+    // Wrap consecutive <li> in <ul>
+    html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+    // Line breaks (but not inside lists)
+    html = html.replace(/\n/g, '<br>');
+    html = html.replace(/<br><li>/g, '<li>');
+    html = html.replace(/<\/li><br>/g, '</li>');
+    html = html.replace(/<br><\/ul>/g, '</ul>');
+    html = html.replace(/<ul><br>/g, '<ul>');
+    return html;
+  };
 
   const tabs: { id: ActiveTab; label: string; count?: number }[] = [
     { id: 'summary', label: 'Summary' },
@@ -316,7 +339,10 @@ export default function App() {
                       {msg.role === 'user' ? '👤' : '🧠'}
                     </div>
                     <div className="message__content" style={{ width: '100%' }}>
-                      <div className="message__bubble">{msg.content}</div>
+                      {msg.role === 'agent'
+                        ? <div className="message__bubble message__bubble--md" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+                        : <div className="message__bubble">{msg.content}</div>
+                      }
                       {msg.role === 'agent' && msg.response && (
                         <div className="message__meta">
                           <span>
@@ -331,8 +357,11 @@ export default function App() {
                             }} />
                           </div>
                           {hasSpeechSynthesis && (
-                            <button onClick={() => speakText(msg.content)} title="Read aloud">
-                              🔊
+                            <button
+                              onClick={() => isSpeaking ? stopSpeaking() : speakText(msg.content)}
+                              title={isSpeaking ? 'Stop speaking' : 'Read aloud'}
+                            >
+                              {isSpeaking ? '⏸️' : '🔊'}
                             </button>
                           )}
                         </div>
@@ -549,16 +578,7 @@ export default function App() {
                 autoFocus={activeTab === 'query'}
               />
 
-              {hasSpeechSynthesis && (
-                <button
-                  onClick={() => { if (isSpeaking) stopSpeaking(); else setTtsEnabled(p => !p); }}
-                  className={`chat-input__btn voice-btn ${isSpeaking ? 'voice-btn--recording' : ''}`}
-                  title={isSpeaking ? 'Stop speaking' : ttsEnabled ? 'Auto-read ON' : 'Auto-read OFF'}
-                  style={{ opacity: ttsEnabled || isSpeaking ? 1 : 0.45 }}
-                >
-                  {isSpeaking ? '⏸️' : ttsEnabled ? '🔊' : '🔇'}
-                </button>
-              )}
+
 
               <button
                 onClick={() => handleSend()}
