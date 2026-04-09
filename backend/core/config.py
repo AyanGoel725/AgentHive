@@ -15,9 +15,9 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # ── Google Gemini ──────────────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 
-FAST_MODEL_NAME: str = os.getenv("FAST_MODEL_NAME", os.getenv("MODEL_NAME", "gemini-2.0-flash"))
-QA_MODEL_NAME: str = os.getenv("QA_MODEL_NAME", os.getenv("MODEL_NAME", "gemini-2.0-flash"))
-MODEL_NAME: str = os.getenv("MODEL_NAME", "gemini-2.0-flash")
+FAST_MODEL_NAME: str = os.getenv("FAST_MODEL_NAME", os.getenv("MODEL_NAME", "gemini-2.5-flash"))
+QA_MODEL_NAME: str = os.getenv("QA_MODEL_NAME", os.getenv("MODEL_NAME", "gemini-2.5-flash"))
+MODEL_NAME: str = os.getenv("MODEL_NAME", "gemini-2.5-flash")
 
 # IMPORTANT: langchain-google-genai v2+ does NOT accept the 'models/' prefix.
 # Strip it here at config load time so every agent gets the correct format.

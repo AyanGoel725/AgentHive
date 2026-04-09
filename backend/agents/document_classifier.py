@@ -1,21 +1,17 @@
 """
-🏷️ Document Classifier Agent
-──────────────────────────────
-Classifies the document type using LLM analysis of the content.
-Determines: report, questionnaire, form, contract, invoice, resume, etc.
-This drives the downstream agent selection (do we run question extraction?).
-
-Uses the FAST model (gemini-2.0-flash) for speed — classification is latency-critical.
+Document Classifier Agent — Fast, deterministic classification.
+Uses temperature=0.0 for zero hallucination in type detection.
+Uses the LLM pool for instant access (no per-call instantiation).
 """
 from __future__ import annotations
 
 import json
 
-from core.config import GOOGLE_API_KEY, FAST_MODEL_NAME, is_demo_mode
+from core.config import FAST_MODEL_NAME, is_demo_mode
 from core.schemas import ClassificationResult, DocumentType
 from core.utils import estimate_reading_time
+from core.llm_pool import get_llm
 
-# Classification prompt — carefully designed to detect forms/questionnaires
 _CLASSIFY_PROMPT = """\
 You are a document classification expert. Analyze the document content below and classify it.
 
@@ -33,13 +29,12 @@ Return ONLY a valid JSON object with this exact structure:
   "estimated_word_count": <integer>
 }}
 
-Key guidance:
-- Mark is_form_or_questionnaire=true if the document contains questions to be answered,
-  input fields, checkboxes, or survey-style content.
-- A "questionnaire" has a series of questions expecting user responses.
-- A "form" has labeled fields for data entry.
-- A "report" presents findings, data, or analysis narratively.
-- Confidence should reflect how certain you are.
+RULES:
+- Base your classification ONLY on the content provided. Do NOT guess or assume.
+- Mark is_form_or_questionnaire=true ONLY if the document explicitly contains questions
+  to be answered, input fields, checkboxes, or survey-style content.
+- Confidence should reflect how certain you are based on the evidence in the text.
+- Return ONLY the JSON. No markdown, no explanation.
 """
 
 
@@ -47,14 +42,12 @@ class DocumentClassifierAgent:
     """
     Uses LLM to classify document type and detect if it's a form/questionnaire.
     Falls back to rule-based classification if LLM is unavailable.
-    Uses the FAST model for speed (~2s instead of ~15s).
+    Temperature=0.0 for deterministic, hallucination-free classification.
     """
 
     def classify(self, raw_text: str, file_type: str) -> ClassificationResult:
-        """
-        Classify the document based on its content.
-        """
-        # Excel/CSV are always spreadsheets
+        """Classify the document based on its content."""
+        # Excel/CSV are always spreadsheets — skip LLM
         if file_type in ("excel", "csv"):
             return self._classify_spreadsheet(raw_text)
 
@@ -83,15 +76,10 @@ class DocumentClassifierAgent:
         )
 
     def _classify_with_llm(self, raw_text: str) -> ClassificationResult:
-        """LLM-powered classification using Google Gemini Flash (fast)."""
-        from langchain_google_genai import ChatGoogleGenerativeAI
+        """LLM-powered classification using the pooled fast model at temperature=0.0."""
         from langchain.schema import HumanMessage
 
-        llm = ChatGoogleGenerativeAI(
-            model=FAST_MODEL_NAME,
-            google_api_key=GOOGLE_API_KEY,
-            temperature=0.1,
-        )
+        llm = get_llm(FAST_MODEL_NAME, temperature=0.0)
 
         content_sample = raw_text[:3000]
         prompt = _CLASSIFY_PROMPT.format(content_sample=content_sample)
@@ -124,13 +112,10 @@ class DocumentClassifierAgent:
             return self._classify_with_rules(raw_text)
 
     def _classify_with_rules(self, raw_text: str) -> ClassificationResult:
-        """
-        Rule-based fallback classifier using keyword heuristics.
-        """
+        """Rule-based fallback classifier using keyword heuristics."""
         text_lower = raw_text.lower()
         word_count = len(raw_text.split())
 
-        # Question indicators
         q_indicators = [
             "?", "please answer", "your response", "check all that apply",
             "select one", "rate the following", "on a scale", "q1.", "q2.",
@@ -138,7 +123,6 @@ class DocumentClassifierAgent:
         ]
         q_score = sum(1 for kw in q_indicators if kw in text_lower)
 
-        # Document type signals
         type_map = {
             DocumentType.INVOICE: ["invoice", "billing", "amount due", "total", "payment"],
             DocumentType.CONTRACT: ["agreement", "terms and conditions", "hereby", "party", "clause"],

@@ -1,7 +1,6 @@
-import React from 'react';
 import type { FullAnalysisResult } from '../types';
-import DocumentTypeTag from './DocumentTypeTag';
 import ConfidenceBar from './ConfidenceBar';
+import DocumentTypeTag from './DocumentTypeTag';
 
 interface SummaryViewProps {
   analysis: FullAnalysisResult;
@@ -33,12 +32,12 @@ export default function SummaryView({ analysis }: SummaryViewProps) {
           </div>
         </div>
         <div className="stat-card">
-          <div className="stat-card__label">Word Count</div>
+          <div className="stat-card__label">Word Count (Approx)</div>
           <div className="stat-card__value">{summary.word_count_original.toLocaleString()}</div>
         </div>
         <div className="stat-card">
           <div className="stat-card__label">Reading Time</div>
-          <div className="stat-card__value">~{classification.estimated_reading_time_minutes} min</div>
+          <div className="stat-card__value">~{analysis.processing_time_seconds} s</div>
         </div>
         <div className="stat-card">
           <div className="stat-card__label">File Size</div>

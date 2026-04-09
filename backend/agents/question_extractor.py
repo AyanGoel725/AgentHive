@@ -1,11 +1,8 @@
 """
-❓ Question Extractor Agent
-────────────────────────────
-Specialized agent for extracting ALL questions from forms and questionnaires.
-Groups questions by section, detects type (MCQ, open-ended, rating, yes/no),
-identifies required fields, and extracts answer options.
-
-This is the crown jewel of Use Case 1.
+Question Extractor Agent — Fast, accurate question extraction.
+Switched from MODEL_NAME to FAST_MODEL_NAME for speed.
+Uses temperature=0.0 for zero hallucination.
+Uses the LLM pool for instant access.
 """
 from __future__ import annotations
 
@@ -13,12 +10,13 @@ import json
 import re
 import uuid
 
-from core.config import GOOGLE_API_KEY, MODEL_NAME, is_demo_mode
+from core.config import FAST_MODEL_NAME, is_demo_mode
 from core.schemas import ExtractedQuestion, QuestionCategory, QuestionExtractionResult
 from core.utils import truncate_for_llm
+from core.llm_pool import get_llm
 
 _EXTRACTION_PROMPT = """\
-You are an expert form analyst. Your job is to extract EVERY question from the document below.
+You are an expert form analyst. Extract EVERY question from the document below.
 
 DOCUMENT CONTENT:
 {content}
@@ -53,38 +51,33 @@ Return ONLY a valid JSON object:
   "extraction_confidence": <float 0.0-1.0>
 }}
 
-IMPORTANT:
+STRICT RULES:
+- Extract ONLY questions that are VERBATIM in the document. Do NOT rephrase or generate new questions.
 - Do NOT skip any questions, even if they seem minor.
 - For rating scales like "1-5" or "Strongly Agree to Disagree", set category="rating".
-- Section headers (like "Section A: Personal Information") should be included as category="section_header".
+- Section headers should be included as category="section_header".
 - Sub-questions (a, b, c under a main question) go in sub_questions array.
 - If no questions found, return empty questions array.
+- Return ONLY the JSON. No markdown fences, no explanation.
 """
 
 
 class QuestionExtractorAgent:
     """
     Extracts structured question data from forms and questionnaires.
-    Works on both PDF forms and Excel-based surveys.
+    Uses the fast model at temperature=0.0 for speed and accuracy.
     """
 
     def extract_questions(
         self, raw_text: str, doc_id: str
     ) -> QuestionExtractionResult:
-        """
-        Extract all questions from document text.
-        """
+        """Extract all questions from document text."""
         if is_demo_mode():
             return self._rule_based_extraction(raw_text, doc_id)
 
-        from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain.schema import HumanMessage
 
-        llm = ChatGoogleGenerativeAI(
-            model=MODEL_NAME,
-            google_api_key=GOOGLE_API_KEY,
-            temperature=0.1,
-        )
+        llm = get_llm(FAST_MODEL_NAME, temperature=0.0)
 
         content = truncate_for_llm(raw_text, max_tokens=14000)
         prompt = _EXTRACTION_PROMPT.format(content=content)
@@ -147,16 +140,12 @@ class QuestionExtractorAgent:
     def _rule_based_extraction(
         self, raw_text: str, doc_id: str
     ) -> QuestionExtractionResult:
-        """
-        Fallback rule-based question extraction using regex patterns.
-        Catches numbered questions, question marks, and common form patterns.
-        """
+        """Fallback rule-based question extraction using regex patterns."""
         questions: list[ExtractedQuestion] = []
         lines = raw_text.splitlines()
         current_section: str | None = None
 
-        # Patterns for question detection
-        numbered_q = re.compile(r"^\s*(\d+[\.\)]\s*|\w[\.\)]\s*|Q\d+[\.\:\s])")
+        numbered_q = re.compile(r"^\s*(\d+[\.\\)]\s*|\w[\.\\)]\s*|Q\d+[\.\\:\s])")
         question_mark = re.compile(r".{10,}\?$")
         section_header = re.compile(
             r"^(Section|Part|Category|Group)\s+[\w\d]+[\:\-]", re.IGNORECASE
@@ -167,7 +156,6 @@ class QuestionExtractorAgent:
             if not line:
                 continue
 
-            # Section header detection
             if section_header.match(line) and len(line) < 100:
                 current_section = line
                 questions.append(
@@ -180,7 +168,6 @@ class QuestionExtractorAgent:
                 )
                 continue
 
-            # Numbered question
             m = numbered_q.match(line)
             if m and len(line) > 10:
                 questions.append(
@@ -194,7 +181,6 @@ class QuestionExtractorAgent:
                 )
                 continue
 
-            # Question mark ending
             if question_mark.match(line) and len(line) < 200:
                 questions.append(
                     ExtractedQuestion(

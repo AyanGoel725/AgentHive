@@ -1,21 +1,22 @@
 """
-✍️ Summarization Agent
-───────────────────────
-Generates multi-level summaries:
-  1. Executive summary (TL;DR — 2-3 sentences)
-  2. Detailed summary (structured, sectioned)
-  3. Key points with importance ratings
-  4. Topic tags and sentiment
-
-Uses the FAST model (gemini-2.0-flash) for speed with large context window.
+Summarization Agent — Fast, grounded summaries with anti-hallucination.
+Uses temperature=0.1 for fluent but factual output.
+Uses the LLM pool for instant access.
 """
 from __future__ import annotations
 
 import json
 
-from core.config import GOOGLE_API_KEY, FAST_MODEL_NAME, is_demo_mode
+from core.config import FAST_MODEL_NAME, is_demo_mode
 from core.schemas import KeyPoint, SummaryResult
 from core.utils import truncate_for_llm
+from core.llm_pool import get_llm
+import re
+
+def get_word_count(text: str) -> int:
+    text = text.replace("\n", " ")
+    words = re.findall(r'\b\w+\b', text)
+    return len(words)
 
 _SUMMARY_PROMPT = """\
 You are an expert document analyst. Read the document below and produce a comprehensive analysis.
@@ -33,48 +34,45 @@ Return ONLY a valid JSON object with this exact structure:
     ...
   ],
   "topics": ["<topic tag>", ...],
-  "sentiment": "positive|neutral|negative",
-  "word_count_original": <integer>
+  "sentiment": "positive|neutral|negative"
 }}
 
-Guidelines:
-- The detailed_summary should be genuinely detailed, covering every major section.
-- Key points should be specific, not generic. Include numbers/facts where available.
-- List 5-10 key points.
-- Topics should be 3-8 concise tags (e.g., "IT Strategy", "Risk Management").
-- Sentiment reflects the overall tone of the document.
+STRICT RULES:
+- The detailed_summary MUST cover every major section of the document.
+- Key points MUST be specific facts, numbers, or findings directly from the document.
+- Do NOT include ANY information that is not explicitly stated in the document.
+- Do NOT infer, speculate, or add external knowledge.
+- If the document is short, say so — do NOT pad the summary with invented content.
+- List 5-10 key points. Each must cite a specific fact from the text.
+- Topics should be 3-8 concise tags.
+- Return ONLY the JSON. No markdown fences, no explanation.
 """
 
 
 class SummarizationAgent:
-    """Generates rich, multi-level document summaries using the FAST model."""
+    """Generates rich, grounded document summaries using the pooled fast model."""
 
     def summarize(self, raw_text: str, doc_id: str, doc_type: str = "unknown") -> SummaryResult:
         """
         Generate a full summary of the document.
-        Uses Flash model with up to 120k chars (~30k tokens) for thorough analysis.
+        Uses smart truncation — sends only as much text as needed.
         """
-        word_count = len(raw_text.split())
+        word_count = get_word_count(raw_text)
 
         if is_demo_mode():
             return self._demo_summarize(raw_text, doc_id, word_count)
 
-        from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain.schema import HumanMessage
 
-        llm = ChatGoogleGenerativeAI(
-            model=FAST_MODEL_NAME,
-            google_api_key=GOOGLE_API_KEY,
-            temperature=0.3,
-        )
+        llm = get_llm(FAST_MODEL_NAME, temperature=0.1)
 
-        # Use much more content — up to 30k tokens with Flash's large context
-        content = truncate_for_llm(raw_text, max_tokens=30000)
+        # Smart truncation: small docs get full text, large docs get 30K tokens
+        if word_count < 8000:
+            content = raw_text
+        else:
+            content = truncate_for_llm(raw_text, max_tokens=30000)
 
-        prompt = _SUMMARY_PROMPT.format(
-            doc_type=doc_type,
-            content=content,
-        )
+        prompt = _SUMMARY_PROMPT.format(doc_type=doc_type, content=content)
 
         # Retry up to 2 times for JSON parse failures
         last_error = None
@@ -90,7 +88,7 @@ class SummarizationAgent:
                         raw_content = raw_content[4:]
 
                 data = json.loads(raw_content)
-                original_wc = data.get("word_count_original", word_count)
+                original_wc = word_count
                 summary_wc = len(data.get("detailed_summary", "").split())
 
                 return SummaryResult(
@@ -115,8 +113,8 @@ class SummarizationAgent:
                 last_error = e
                 continue
 
-        # Graceful degradation — return a minimal summary
-        print(f"⚠️ Summarization fallback after {last_error}")
+        # Graceful degradation
+        print(f"[WARNING] Summarization fallback after {last_error}")
         return SummaryResult(
             doc_id=doc_id,
             executive_summary=raw_text[:300] + "...",
