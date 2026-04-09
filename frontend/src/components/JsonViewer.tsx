@@ -1,12 +1,30 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 interface JsonViewerProps {
   data: Record<string, unknown>;
 }
 
 export default function JsonViewer({ data }: JsonViewerProps) {
-  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set(['root']));
+  const getAllKeys = (obj: unknown) => {
+    const keys = new Set<string>();
+    const walk = (val: unknown, prefix: string) => {
+      keys.add(prefix);
+      if (Array.isArray(val)) {
+        val.forEach((item, i) => walk(item, `${prefix}[${i}]`));
+      } else if (val && typeof val === 'object') {
+        Object.entries(val as Record<string, unknown>).forEach(([k, v]) => walk(v, `${prefix}.${k}`));
+      }
+    };
+    walk(obj, 'root');
+    return keys;
+  };
+
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => getAllKeys(data));
   const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    setExpandedKeys(getAllKeys(data));
+  }, [data]);
 
   const toggleKey = (key: string) => {
     setExpandedKeys(prev => {
@@ -24,15 +42,7 @@ export default function JsonViewer({ data }: JsonViewerProps) {
   };
 
   const expandAll = () => {
-    const keys = new Set<string>();
-    const walk = (obj: unknown, prefix: string) => {
-      keys.add(prefix);
-      if (obj && typeof obj === 'object') {
-        Object.keys(obj as Record<string, unknown>).forEach(k => walk((obj as Record<string, unknown>)[k], `${prefix}.${k}`));
-      }
-    };
-    walk(data, 'root');
-    setExpandedKeys(keys);
+    setExpandedKeys(getAllKeys(data));
   };
 
   const collapseAll = () => {
